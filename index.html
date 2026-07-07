@@ -89,6 +89,12 @@
     border: 2px solid rgba(255,255,255,0.25); transition: transform 0.15s;
   }
   .swatch:hover, .swatch:active { transform: scale(1.2); }
+  .swatch.rainbow { background: conic-gradient(#ff5c5c, #ffb84d, #5dff9d, #4dd6ff, #7c5cff, #ff5cd0, #ff5c5c); }
+  #release-btn {
+    position: fixed; top: 112px; left: 50%; transform: translateX(-50%); z-index: 9;
+    display: none; box-shadow: 0 4px 20px rgba(124, 92, 255, 0.35);
+  }
+  #release-btn.on { display: inline-flex; }
 
   /* sliders */
   .slider-group { flex: 1; min-width: 130px; }
@@ -195,12 +201,14 @@
   <div id="stats">
     <div class="chip optional">FPS <b id="fps">–</b></div>
     <div class="chip" id="hands-chip">Hands <b id="hands">0</b></div>
+    <div class="chip">🪐 <b id="picked-count">0</b></div>
   </div>
 </div>
 
 <div id="cam-wrap"><video id="video" autoplay playsinline muted></video><canvas id="overlay"></canvas></div>
 
-<div id="hint">🖐 Move your hand to carry the planets in 3D — push closer to pull them toward you · ✊ clench to crush · 🙌 spread to stretch space</div>
+<div id="hint">☝️ Point &amp; swipe any direction to split the galaxy · hover a planet to pick it · 🤏 pinch to grab · 🖐 open hand carries everything</div>
+<button class="btn" id="release-btn">✨ Release planets</button>
 
 <div id="panel">
   <div class="row">
@@ -212,6 +220,7 @@
       <div class="swatch" style="background:#4dd6ff" data-c="#4dd6ff"></div>
       <div class="swatch" style="background:#5dff9d" data-c="#5dff9d"></div>
       <div class="swatch" style="background:#ffb84d" data-c="#ffb84d"></div>
+      <div class="swatch rainbow" data-c="rainbow" title="Rainbow mode"></div>
     </div>
     <div id="meter-wrap">
       <div class="lbl" style="display:flex;justify-content:space-between;margin-bottom:4px">
@@ -238,9 +247,10 @@
   <h2>Nebula Hands</h2>
   <p>A living mini Milky Way — the Sun, eight planets and swirling stardust that follow your hand through 3D space. Works on desktop &amp; mobile.</p>
   <div class="gestures">
-    <div class="g"><span class="ico">🖐</span>Move = carry in 3D</div>
-    <div class="g"><span class="ico">✊</span>Clench = collapse</div>
-    <div class="g"><span class="ico">✋</span>Open = bloom</div>
+    <div class="g"><span class="ico">☝️</span>Swipe = split</div>
+    <div class="g"><span class="ico">☝️</span>Hover = pick</div>
+    <div class="g"><span class="ico">🤏</span>Pinch = grab</div>
+    <div class="g"><span class="ico">🖐</span>Move = carry</div>
     <div class="g"><span class="ico">🙌</span>Spread = stretch</div>
   </div>
   <button class="btn primary" id="start-cam">📷 Start with hand tracking</button>
@@ -277,12 +287,17 @@ const uniforms = {
   uExpansion: { value: 1 },
   uColor:     { value: new THREE.Color('#7c5cff') },
   uColorB:    { value: new THREE.Color('#4dd6ff') },
+  uColorC:    { value: new THREE.Color('#ff5cd0') },
+  uRainbow:   { value: 0 },
   uSize:      { value: 75 * Math.min(window.devicePixelRatio, 2) },
   uSwirl:     { value: 1 },
+  uSplit:     { value: new THREE.Vector4(0, 0, 1, 0) }, // xy = slice origin, zw = swipe direction (group-local)
+  uSplitAmp:  { value: 0 },
 };
 
 const vertexShader = /* glsl */`
-  uniform float uTime, uExpansion, uSize, uSwirl;
+  uniform float uTime, uExpansion, uSize, uSwirl, uSplitAmp;
+  uniform vec4 uSplit;
   attribute vec3 aBase;
   attribute float aRand;
   varying float vDepth, vRand, vRadius;
@@ -303,6 +318,12 @@ const vertexShader = /* glsl */`
       cos(uTime * 1.1 + aRand * 30.0),
       sin(uTime * 0.9 + aRand * 50.0));
     p *= exp2_;
+    // slice wave: dust parts away from the last finger-swipe line, then flows back
+    if (uSplitAmp > 0.001) {
+      vec2 n = vec2(-uSplit.w, uSplit.z);
+      float sideD = dot(p.xy - uSplit.xy, n);
+      p.xy += n * sign(sideD) * uSplitAmp * (0.7 + 0.3 * aRand) * exp(-abs(sideD) * 0.5);
+    }
     vec4 mv = modelViewMatrix * vec4(p, 1.0);
     vDepth = -mv.z;
     vRand = aRand;
@@ -311,19 +332,27 @@ const vertexShader = /* glsl */`
   }
 `;
 const fragmentShader = /* glsl */`
-  uniform vec3 uColor, uColorB;
-  uniform float uTime;
+  uniform vec3 uColor, uColorB, uColorC;
+  uniform float uTime, uRainbow;
   varying float vDepth, vRand, vRadius;
+  vec3 hsv2rgb(vec3 c) {
+    vec3 p = abs(fract(c.xxx + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+    return c.z * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), c.y);
+  }
   void main() {
     vec2 uv = gl_PointCoord - 0.5;
     float d = length(uv);
     if (d > 0.5) discard;
     float glow = pow(1.0 - d * 2.0, 1.8);
-    // core particles run hot (whiter), rim particles take the secondary color
-    vec3 col = mix(uColor, uColorB, smoothstep(0.15, 1.0, vRadius));
-    col = mix(vec3(1.0), col, smoothstep(0.0, 0.5, vRadius));
+    // three-color palette scattered through the cloud, blended out from the core
+    vec3 pal = vRand < 0.5 ? mix(uColor, uColorB, vRand * 2.0) : mix(uColorB, uColorC, vRand * 2.0 - 1.0);
+    vec3 col = mix(uColor, pal, smoothstep(0.1, 0.9, vRadius));
+    // rainbow mode: full hue wheel by radius, slowly cycling
+    vec3 rain = hsv2rgb(vec3(fract(vRadius * 0.75 + vRand * 0.12 + uTime * 0.02), 0.85, 1.0));
+    col = mix(col, rain, uRainbow);
+    col = mix(vec3(1.0), col, smoothstep(0.0, 0.5, vRadius)); // white-hot core
     float tw = 0.8 + 0.2 * sin(uTime * (2.0 + vRand * 6.0) + vRand * 90.0);
-    gl_FragColor = vec4(col * glow * tw * 1.7, glow);
+    gl_FragColor = vec4(col * glow * tw * 2.3, glow);
   }
 `;
 
@@ -376,7 +405,7 @@ buildParticles(20000);
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ size: 0.08, color: 0x8899ff, transparent: true, opacity: 0.5 })));
+  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ size: 0.1, color: 0xaabbff, transparent: true, opacity: 0.75 })));
 }
 
 /* ---------- Solar system (lives inside the dust, same world group) ---------- */
@@ -435,13 +464,15 @@ const planets = [];
   const glow = new THREE.Sprite(new THREE.SpriteMaterial({
     map: new THREE.CanvasTexture(gc), blending: THREE.AdditiveBlending, depthWrite: false, transparent: true }));
   glow.scale.set(2.6, 2.6, 1);
-  world.add(sun, glow, new THREE.PointLight(0xfff0d0, 60, 0, 2));
-  scene.add(new THREE.AmbientLight(0x8899bb, 0.6));
+  world.add(sun, glow, new THREE.PointLight(0xfff0d0, 90, 0, 2));
+  scene.add(new THREE.AmbientLight(0x99aadd, 1.1));
 
   for (const p of PLANETS) {
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(p.r, 28, 20),
-      new THREE.MeshStandardMaterial({ map: bandTexture(p.cols), roughness: 0.85, metalness: 0 }));
+      new THREE.MeshStandardMaterial({
+        map: bandTexture(p.cols), roughness: 0.85, metalness: 0,
+        emissive: new THREE.Color(p.cols[0]), emissiveIntensity: 0.28 }));
     if (p.ring) {
       const ring = new THREE.Mesh(
         new THREE.RingGeometry(p.r * 1.35, p.r * 2.2, 48),
@@ -449,7 +480,12 @@ const planets = [];
       ring.rotation.x = Math.PI / 2.35;
       mesh.add(ring);
     }
-    const entry = { ...p, mesh, phase: Math.random() * Math.PI * 2, incl: (Math.random() - 0.5) * 0.14 };
+    const entry = {
+      ...p, mesh, phase: Math.random() * Math.PI * 2, incl: (Math.random() - 0.5) * 0.14,
+      split: new THREE.Vector3(), kick: new THREE.Vector3(),   // slice impulse physics
+      hold: new THREE.Vector3(), blend: 0, picked: false, hover: 0, // pick/grab state
+    };
+    mesh.userData.planet = entry;
     if (p.moon) {
       entry.moonMesh = new THREE.Mesh(
         new THREE.SphereGeometry(0.045, 12, 8),
@@ -467,9 +503,34 @@ const planets = [];
       new THREE.BufferGeometry().setFromPoints(pts),
       new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.07 }));
     entry.orbitLine.rotation.z = entry.incl;
-    world.add(mesh, entry.label, entry.orbitLine);
+    // glowing selection ring shown while hovered / picked
+    const rc = document.createElement('canvas'); rc.width = rc.height = 128;
+    const rx = rc.getContext('2d');
+    rx.strokeStyle = 'rgba(255,255,255,0.95)'; rx.lineWidth = 5;
+    rx.shadowColor = '#9d7bff'; rx.shadowBlur = 18;
+    rx.beginPath(); rx.arc(64, 64, 44, 0, 7); rx.stroke();
+    entry.ring = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: new THREE.CanvasTexture(rc), transparent: true, opacity: 0,
+      depthWrite: false, blending: THREE.AdditiveBlending }));
+    world.add(mesh, entry.label, entry.orbitLine, entry.ring);
     planets.push(entry);
   }
+}
+
+/* ---------- fingertip comet cursor ---------- */
+const cursor = { active: false, mode: 'point', world: new THREE.Vector3(), vel: new THREE.Vector3() };
+{
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const x = c.getContext('2d');
+  const g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.3, 'rgba(200,170,255,0.9)');
+  g.addColorStop(1, 'rgba(150,90,255,0)');
+  x.fillStyle = g; x.fillRect(0, 0, 64, 64);
+  cursor.sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: new THREE.CanvasTexture(c), blending: THREE.AdditiveBlending, depthWrite: false, transparent: true }));
+  cursor.sprite.visible = false;
+  scene.add(cursor.sprite);
 }
 
 function resize() {
@@ -498,6 +559,58 @@ function resetWorld() {
   gesture.expansionTarget = 1;
   gesture.rotXTarget = gesture.rotYTarget = gesture.rotZTarget = 0;
   gesture.posXTarget = gesture.posYTarget = gesture.posZTarget = 0;
+}
+
+/* ---------- shared slice / pick machinery (hands + touch) ---------- */
+const TMP = new THREE.Vector3(), TMP2 = new THREE.Vector3();
+const raycaster = new THREE.Raycaster();
+let grabbedPlanet = null;
+
+// map normalized camera-frame coords (mirrored) to the world z=0 plane
+function frameToWorld(fx, fy, out) {
+  const h = 2 * camera.position.z * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  return out.set((0.5 - fx) * h * camera.aspect, (0.5 - fy) * h + 0.3, 0);
+}
+// map CSS pixel coords to the world z=0 plane
+function screenToWorld(px, py, out) {
+  const h = 2 * camera.position.z * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  return out.set((px / innerWidth - 0.5) * h * camera.aspect, (0.5 - py / innerHeight) * h + 0.3, 0);
+}
+// split everything (dust + planets) away from a swipe line, any direction
+function doSlice(origin, vel, strength) {
+  const lo = world.worldToLocal(origin.clone());
+  const ld = vel.clone().applyQuaternion(world.quaternion.clone().invert()).setZ(0).normalize();
+  if (!ld.lengthSq()) return;
+  uniforms.uSplit.value.set(lo.x, lo.y, ld.x, ld.y);
+  uniforms.uSplitAmp.value = strength;
+  const n = new THREE.Vector3(-ld.y, ld.x, 0);
+  for (const p of planets) {
+    const sideD = TMP.copy(p.mesh.position).sub(lo).dot(n);
+    p.kick.addScaledVector(n, Math.sign(sideD || 1) * strength * 3.2 * Math.exp(-Math.abs(sideD) * 0.35));
+  }
+}
+function planetAt(px, py) {
+  raycaster.setFromCamera({ x: (px / innerWidth) * 2 - 1, y: -(py / innerHeight) * 2 + 1 }, camera);
+  const hits = raycaster.intersectObjects(planets.map(p => p.mesh), true);
+  if (!hits.length) return null;
+  let o = hits[0].object;
+  while (o && !o.userData.planet) o = o.parent;
+  return o ? o.userData.planet : null;
+}
+function updatePickedUI() {
+  const n = planets.filter(p => p.picked).length;
+  document.getElementById('picked-count').textContent = n;
+  document.getElementById('release-btn').classList.toggle('on', n > 0);
+}
+function togglePick(p) {
+  p.picked = !p.picked;
+  if (p.picked) p.hold.copy(p.mesh.position);
+  updatePickedUI();
+}
+function releaseAll() {
+  grabbedPlanet = null;
+  planets.forEach(p => { p.picked = false; p.hover = 0; });
+  updatePickedUI();
 }
 
 /* ================================================================
@@ -549,7 +662,7 @@ async function enableCamera() {
     camOn = true;
     camWrap.classList.add('on'); handsChip.classList.add('live');
     btn.textContent = '⏹ Stop camera'; btn.classList.add('danger-on');
-    showHint('✋ Show your hand to the camera');
+    showHint('☝️ Point to slice & pick · 🤏 pinch to grab · 🖐 open hand to carry');
   } catch (err) {
     console.error('Camera / model error:', err);
     showHint(location.protocol === 'http:' && !['localhost','127.0.0.1'].includes(location.hostname)
@@ -574,6 +687,7 @@ function handCenter(lm) {
 }
 
 let smoothOpen = 0.5, smoothSpread = 1, smoothPalm = 0.13;
+let lastHandNow = 0, lastSliceT = 0, wasPinch = false;
 function processHands(now) {
   if (!camOn || !landmarker || video.readyState < 2) return;
   if (video.currentTime === lastVideoTime) return;
@@ -601,37 +715,91 @@ function processHands(now) {
   }
   if (!hands.length) return;
 
-  // --- gesture math ---
-  const open = hands.reduce((s, lm) => s + handOpenness(lm), 0) / hands.length;
-  smoothOpen += (open - smoothOpen) * 0.35;
+  // --- pose classification: pinch > point > open/fist ---
+  const poses = hands.map(lm => {
+    const palm = Math.hypot(lm[9].x - lm[0].x, lm[9].y - lm[0].y) || 1e-4;
+    const dW = i => Math.hypot(lm[i].x - lm[0].x, lm[i].y - lm[0].y);
+    const pinch = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y) / palm < 0.42;
+    const point = !pinch && dW(8) > dW(6) * 1.12 && dW(12) < dW(10) * 1.12 && dW(16) < dW(14) * 1.12;
+    return { lm, palm, pinch, point, center: handCenter(lm), open: handOpenness(lm) };
+  });
+  const cursorPose = poses.find(p => p.pinch || p.point);
+  const carry = poses.filter(p => !p.pinch && !p.point);
 
-  let spread = 1, cx, cy;
-  if (hands.length === 2) {
-    const c0 = handCenter(hands[0]), c1 = handCenter(hands[1]);
-    const d = Math.hypot(c0.x - c1.x, c0.y - c1.y); // 0…~1 of frame
-    spread = THREE.MathUtils.mapLinear(THREE.MathUtils.clamp(d, 0.08, 0.75), 0.08, 0.75, 0.55, 1.9);
-    cx = (c0.x + c1.x) / 2; cy = (c0.y + c1.y) / 2;
-    // tilting the line between your hands rolls the whole system
-    const [L, R] = c0.x > c1.x ? [c0, c1] : [c1, c0]; // leftmost on user's mirrored view
-    gesture.rotZTarget = THREE.MathUtils.clamp(Math.atan2(L.y - R.y, R.x - L.x), -0.9, 0.9);
+  // --- fingertip cursor: swipe = slice, dwell = pick, pinch = grab ---
+  const nowS = now / 1000;
+  const hdt = THREE.MathUtils.clamp(nowS - lastHandNow, 0.001, 0.1);
+  lastHandNow = nowS;
+  if (cursorPose) {
+    const tip = cursorPose.pinch
+      ? { x: (cursorPose.lm[4].x + cursorPose.lm[8].x) / 2, y: (cursorPose.lm[4].y + cursorPose.lm[8].y) / 2 }
+      : cursorPose.lm[8];
+    const prev = TMP2.copy(cursor.world);
+    frameToWorld(tip.x, tip.y, cursor.world);
+    cursor.vel.copy(cursor.world).sub(prev).divideScalar(hdt);
+    const speed = Math.hypot(cursor.vel.x, cursor.vel.y);
+    if (cursor.active && cursorPose.point && speed > 5.5 && nowS - lastSliceT > 0.35) {
+      lastSliceT = nowS;
+      doSlice(prev, cursor.vel, Math.min(1.6, speed * 0.14));
+    }
+    cursor.active = true;
+    cursor.mode = cursorPose.pinch ? 'pinch' : 'point';
+    // pinch closes → grab the nearest planet within reach; opens → let it go home
+    if (cursorPose.pinch && !wasPinch) {
+      let best = null, bd = Infinity;
+      for (const p of planets) {
+        const d = p.mesh.getWorldPosition(TMP).distanceTo(cursor.world);
+        if (d < Math.max(0.8, p.r * 2.2) && d < bd) { best = p; bd = d; }
+      }
+      if (best) { grabbedPlanet = best; best.hold.copy(world.worldToLocal(cursor.world.clone())); }
+    }
+    if (!cursorPose.pinch) grabbedPlanet = null;
+    wasPinch = cursorPose.pinch;
+    // hold the pointing fingertip on a planet ~½s to pick / unpick it
+    if (cursorPose.point) {
+      for (const p of planets) {
+        const d = p.mesh.getWorldPosition(TMP).distanceTo(cursor.world);
+        if (d < Math.max(0.5, p.r * 1.9)) {
+          p.hover += hdt;
+          if (p.hover > 0.55) { togglePick(p); p.hover = -0.8; } // negative = debounce
+        } else p.hover = Math.max(0, p.hover - hdt * 2);
+      }
+    }
   } else {
-    const c = handCenter(hands[0]);
-    cx = c.x; cy = c.y;
-    gesture.rotZTarget *= 0.95; // roll relaxes when the second hand leaves
+    cursor.active = false;
+    grabbedPlanet = null;
+    wasPinch = false;
   }
-  smoothSpread += (spread - smoothSpread) * 0.25;
 
-  // openness drives bloom, two-hand distance multiplies it
-  setExpansion((0.3 + smoothOpen * 1.5) * smoothSpread);
+  // --- carry / expansion driven by open or fisted hands only ---
+  if (carry.length) {
+    const open = carry.reduce((s, p) => s + p.open, 0) / carry.length;
+    smoothOpen += (open - smoothOpen) * 0.35;
+    let spread = 1, cx, cy;
+    if (carry.length === 2) {
+      const c0 = carry[0].center, c1 = carry[1].center;
+      const d = Math.hypot(c0.x - c1.x, c0.y - c1.y); // 0…~1 of frame
+      spread = THREE.MathUtils.mapLinear(THREE.MathUtils.clamp(d, 0.08, 0.75), 0.08, 0.75, 0.55, 1.9);
+      cx = (c0.x + c1.x) / 2; cy = (c0.y + c1.y) / 2;
+      // tilting the line between your hands rolls the whole system
+      const [L, R] = c0.x > c1.x ? [c0, c1] : [c1, c0]; // leftmost on user's mirrored view
+      gesture.rotZTarget = THREE.MathUtils.clamp(Math.atan2(L.y - R.y, R.x - L.x), -0.9, 0.9);
+    } else {
+      cx = carry[0].center.x; cy = carry[0].center.y;
+      gesture.rotZTarget *= 0.95; // roll relaxes when the second hand leaves
+    }
+    smoothSpread += (spread - smoothSpread) * 0.25;
 
-  // hand position carries the whole system in 3D (mirrored → follows your hand)
-  gesture.posXTarget = (0.5 - cx) * 4.4;
-  gesture.posYTarget = (0.5 - cy) * 3.0;
-  // palm size in frame ≈ distance to camera: push your hand closer to pull the planets toward you
-  const lm0 = hands[0];
-  const palm = Math.hypot(lm0[9].x - lm0[0].x, lm0[9].y - lm0[0].y);
-  smoothPalm += (palm - smoothPalm) * 0.2;
-  gesture.posZTarget = THREE.MathUtils.clamp((smoothPalm - 0.13) * 16, -2.2, 2.6);
+    // openness drives bloom, two-hand distance multiplies it
+    setExpansion((0.3 + smoothOpen * 1.5) * smoothSpread);
+
+    // hand position carries the whole system in 3D (mirrored → follows your hand)
+    gesture.posXTarget = (0.5 - cx) * 4.4;
+    gesture.posYTarget = (0.5 - cy) * 3.0;
+    // palm size in frame ≈ distance to camera: push closer to pull the planets toward you
+    smoothPalm += (carry[0].palm - smoothPalm) * 0.2;
+    gesture.posZTarget = THREE.MathUtils.clamp((smoothPalm - 0.13) * 16, -2.2, 2.6);
+  }
 }
 
 /* ================================================================
@@ -639,14 +807,13 @@ function processHands(now) {
 ================================================================ */
 const pointers = new Map();
 let pinchStartDist = 0, pinchStartExp = 1, dragStart = null, dragStartRot = null;
-let pinchStartMid = null, panStartPos = null, lastTap = 0;
+let pinchStartMid = null, panStartPos = null, lastTap = 0, downInfo = null;
 
 canvas.addEventListener('pointerdown', e => {
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (pointers.size === 1) {
-    const now = performance.now();
-    if (now - lastTap < 300) resetWorld(); // double-tap resets the system
-    lastTap = now;
+    downInfo = { x: e.clientX, y: e.clientY, t: performance.now(),
+                 rx: gesture.rotXTarget, ry: gesture.rotYTarget };
     dragStart = { x: e.clientX, y: e.clientY };
     dragStartRot = { x: gesture.rotXTarget, y: gesture.rotYTarget };
   } else if (pointers.size === 2) {
@@ -655,15 +822,21 @@ canvas.addEventListener('pointerdown', e => {
     pinchStartExp = gesture.expansionTarget;
     pinchStartMid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
     panStartPos = { x: gesture.posXTarget, y: gesture.posYTarget };
-    dragStart = null;
+    dragStart = null; downInfo = null;
   }
 });
 canvas.addEventListener('pointermove', e => {
   if (!pointers.has(e.pointerId)) return;
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (pointers.size === 1 && dragStart) {
-    gesture.rotYTarget = dragStartRot.y + (e.clientX - dragStart.x) * 0.006;
-    gesture.rotXTarget = dragStartRot.x + (e.clientY - dragStart.y) * 0.004;
+    if (planets.some(p => p.picked)) {
+      // with planets picked, dragging carries them around instead of orbiting
+      screenToWorld(e.clientX, e.clientY, cursor.world);
+      cursor.active = true; cursor.mode = 'point';
+    } else {
+      gesture.rotYTarget = dragStartRot.y + (e.clientX - dragStart.x) * 0.006;
+      gesture.rotXTarget = dragStartRot.x + (e.clientY - dragStart.y) * 0.004;
+    }
   } else if (pointers.size === 2) {
     const [a, b] = [...pointers.values()];
     const d = Math.hypot(a.x - b.x, a.y - b.y);
@@ -676,7 +849,31 @@ canvas.addEventListener('pointermove', e => {
     }
   }
 });
-const endPointer = e => { pointers.delete(e.pointerId); dragStart = null; if (pointers.size < 2) { pinchStartDist = 0; pinchStartMid = null; } };
+const endPointer = e => {
+  const down = downInfo; downInfo = null;
+  pointers.delete(e.pointerId);
+  dragStart = null;
+  if (pointers.size < 2) { pinchStartDist = 0; pinchStartMid = null; }
+  if (pointers.size === 0 && !camOn) cursor.active = false;
+  if (!down || e.type === 'pointercancel') return;
+  const dms = performance.now() - down.t;
+  const dx = e.clientX - down.x, dy = e.clientY - down.y;
+  const dist = Math.hypot(dx, dy);
+  if (dms < 300 && dist < 12) {
+    // tap a planet = pick / unpick; double-tap empty space = reset everything
+    const hit = planetAt(e.clientX, e.clientY);
+    if (hit) { togglePick(hit); return; }
+    if (performance.now() - lastTap < 350) { releaseAll(); resetWorld(); }
+    lastTap = performance.now();
+  } else if (dms < 340 && dist > 70) {
+    // fast flick = cosmic karate chop: split dust + planets across the swipe line
+    // (undo the incidental drag-rotation so the flick reads as a clean slice)
+    gesture.rotXTarget = down.rx; gesture.rotYTarget = down.ry;
+    const o = screenToWorld(down.x + dx / 2, down.y + dy / 2, new THREE.Vector3());
+    const d = new THREE.Vector3(dx, -dy, 0);
+    doSlice(o, d, THREE.MathUtils.clamp(dist / dms, 0.6, 1.6));
+  }
+};
 canvas.addEventListener('pointerup', endPointer);
 canvas.addEventListener('pointercancel', endPointer);
 canvas.addEventListener('wheel', e => {
@@ -698,16 +895,24 @@ function showHint(msg, ms = 4200) {
 
 const colorInput = document.getElementById('color');
 function applyColor(hex) {
+  if (hex === 'rainbow') {
+    uniforms.uRainbow.value = 1;
+    document.documentElement.style.setProperty('--accent', '#c17cff');
+    return;
+  }
+  uniforms.uRainbow.value = 0;
   colorInput.value = hex;
   uniforms.uColor.value.set(hex);
-  // auto secondary: rotate hue ~60° for a rich two-tone gradient
+  // auto companions: hue-shift both ways for a vivid three-tone gradient
   const hsl = {}; uniforms.uColor.value.getHSL(hsl);
-  uniforms.uColorB.value.setHSL((hsl.h + 0.17) % 1, Math.min(1, hsl.s * 1.1), Math.min(0.8, hsl.l + 0.15));
+  uniforms.uColorB.value.setHSL((hsl.h + 0.13) % 1, Math.min(1, hsl.s * 1.2), Math.min(0.85, hsl.l + 0.22));
+  uniforms.uColorC.value.setHSL((hsl.h + 0.87) % 1, Math.min(1, hsl.s * 1.1), Math.min(0.8, hsl.l + 0.1));
   document.documentElement.style.setProperty('--accent', hex);
 }
 colorInput.addEventListener('input', e => applyColor(e.target.value));
 document.querySelectorAll('.swatch').forEach(s =>
   s.addEventListener('click', () => applyColor(s.dataset.c)));
+applyColor('#7c5cff');
 
 const countInput = document.getElementById('count');
 countInput.addEventListener('change', e => {
@@ -724,6 +929,7 @@ speedInput.addEventListener('input', e => {
 });
 
 document.getElementById('cam-btn').addEventListener('click', enableCamera);
+document.getElementById('release-btn').addEventListener('click', releaseAll);
 document.getElementById('panel-toggle').addEventListener('click', () =>
   document.getElementById('panel').classList.toggle('hidden'));
 
@@ -765,22 +971,59 @@ function loop(now) {
   // your hand carries the whole system — dust, sun and planets together
   world.rotation.set(gesture.rotX, gesture.rotY, gesture.rotZ);
   world.position.set(gesture.posX, gesture.posY, gesture.posZ);
+  world.updateMatrixWorld();
 
   // planet orbits (orbital speed follows the Swirl slider, radius follows expansion)
   const t = uniforms.uTime.value;
   const ex = gesture.expansion;
   const orbSpeed = 0.25 + uniforms.uSwirl.value * 0.75;
+  const cursorLocal = cursor.active ? world.worldToLocal(TMP.copy(cursor.world)).clone() : null;
+  const held = planets.filter(p => p.picked || p === grabbedPlanet);
   for (const p of planets) {
     const a = t * p.speed * orbSpeed + p.phase;
     const v = new THREE.Vector3(Math.cos(a), 0, Math.sin(a)).multiplyScalar(p.orbit * ex);
     v.applyAxisAngle(ZAXIS, p.incl);
+    // slice impulse: underdamped spring so split planets bounce back into orbit
+    p.kick.addScaledVector(p.split, -dt * 7);
+    p.kick.multiplyScalar(Math.exp(-dt * 2.2));
+    p.split.addScaledVector(p.kick, dt);
+    // picked planets fly to the cursor and circle it in a slow formation
+    const isHeld = p.picked || p === grabbedPlanet;
+    if (isHeld && cursorLocal) {
+      const i = held.indexOf(p);
+      const rr = held.length > 1 ? 0.5 + held.length * 0.09 : 0;
+      const fa = t * 0.9 + (i / held.length) * Math.PI * 2;
+      TMP2.set(
+        cursorLocal.x + Math.cos(fa) * rr,
+        cursorLocal.y + Math.sin(fa) * rr * 0.7,
+        cursorLocal.z + 0.15 * Math.sin(t * 1.3 + i));
+      p.hold.lerp(TMP2, Math.min(1, dt * 9));
+    }
+    p.blend += ((isHeld ? 1 : 0) - p.blend) * Math.min(1, dt * 5);
+    const b = p.blend * p.blend * (3 - 2 * p.blend);
+    v.lerp(p.hold, b).add(p.split);
     p.mesh.position.copy(v);
     p.mesh.rotation.y += dt * 0.6;
     p.label.position.set(v.x, v.y + p.r + 0.24, v.z);
     p.orbitLine.scale.setScalar(ex);
+    // hover / picked glow ring
+    const ringA = Math.max(b, Math.min(1, Math.max(0, p.hover) / 0.55) * 0.6);
+    p.ring.material.opacity = ringA * (0.65 + 0.25 * Math.sin(t * 5));
+    p.ring.position.copy(v);
+    const rs = p.r * 4.2 * (1 + 0.08 * Math.sin(t * 3 + p.orbit));
+    p.ring.scale.set(rs, rs, 1);
     if (p.moonMesh) p.moonMesh.position.set(
       v.x + Math.cos(t * 3.2) * 0.34, v.y + 0.05, v.z + Math.sin(t * 3.2) * 0.34);
   }
+
+  // fingertip comet + slice wave decay
+  cursor.sprite.visible = cursor.active;
+  if (cursor.active) {
+    cursor.sprite.position.copy(cursor.world);
+    const cs = (cursor.mode === 'pinch' ? 0.62 : 0.45) * (1 + 0.12 * Math.sin(t * 7));
+    cursor.sprite.scale.set(cs, cs, 1);
+  }
+  uniforms.uSplitAmp.value *= Math.exp(-dt * 2.4);
 
   camera.position.z = 7.5 + (gesture.expansion - 1) * 0.6; // subtle dolly so big clouds still fit
   camera.lookAt(0, 0, 0);
